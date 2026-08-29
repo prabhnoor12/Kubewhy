@@ -1,0 +1,36 @@
+{
+  "pod": {
+    "apiVersion": "v1",
+    "kind": "Pod",
+    "metadata": { "name": "api", "namespace": "payments" },
+    "spec": {
+      "nodeName": "worker-1",
+      "containers": [
+        {
+          "name": "api",
+          "image": "registry.example.com/payments/api:v4",
+          "resources": {
+            "requests": { "cpu": "500m", "memory": "256Mi" },
+            "limits": { "cpu": "1", "memory": "512Mi" }
+          }
+        }
+      ]
+    },
+    "status": {
+      "phase": "Running",
+      "conditions": [{ "type": "Ready", "status": "False", "reason": "ContainersNotReady", "message": "containers with unready status: [api]" }],
+      "containerStatuses": [{
+        "name": "api",
+        "ready": false,
+        "restartCount": 7,
+        "state": { "waiting": { "reason": "CrashLoopBackOff", "message": "back-off 5m0s restarting failed container" } },
+        "lastState": { "terminated": { "exitCode": 1, "reason": "Error", "message": "process exited" } }
+      }]
+    }
+  },
+  "events": [{ "type": "Warning", "reason": "BackOff", "message": "Back-off restarting failed container api", "count": 8, "source": "kubelet" }],
+  "logs": [{ "container": "api", "previous": true, "text": "panic: database unavailable\nmain.main()" }],
+  "resources": {
+    "nodes": [{ "name": "worker-1", "schedulable": true, "availableCpuMillicores": 2000, "availableMemoryBytes": 1073741824 }]
+  }
+}
