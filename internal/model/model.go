@@ -6,10 +6,11 @@ import "time"
 // Pod follows the shape of a Kubernetes Pod but only models fields needed by
 // the checks. Unknown fields are intentionally ignored by encoding/json.
 type DiagnoseRequest struct {
-	Pod       Pod             `json:"pod"`
-	Events    []Event         `json:"events,omitempty"`
-	Logs      []ContainerLog  `json:"logs,omitempty"`
-	Resources ResourceContext `json:"resources,omitempty"`
+	Pod              Pod             `json:"pod"`
+	Events           []Event         `json:"events,omitempty"`
+	Logs             []ContainerLog  `json:"logs,omitempty"`
+	CollectionErrors []string        `json:"collectionErrors,omitempty"`
+	Resources        ResourceContext `json:"resources,omitempty"`
 }
 
 type Pod struct {
@@ -137,7 +138,10 @@ type Report struct {
 	GeneratedAt      time.Time          `json:"generatedAt"`
 	Pod              PodIdentity        `json:"pod"`
 	Status           string             `json:"status"`
+	Confidence       string             `json:"confidence"`
+	MissingContext   []string           `json:"missingContext,omitempty"`
 	Summary          string             `json:"summary"`
+	RootCause        *Reason            `json:"rootCause,omitempty"`
 	Reasons          []Reason           `json:"reasons"`
 	Containers       []ContainerFinding `json:"containers"`
 	RelevantEvents   []EventFinding     `json:"relevantEvents"`
@@ -155,6 +159,7 @@ type PodIdentity struct {
 type Reason struct {
 	Code        string   `json:"code"`
 	Severity    string   `json:"severity"`
+	Confidence  string   `json:"confidence"`
 	Title       string   `json:"title"`
 	Explanation string   `json:"explanation"`
 	Evidence    []string `json:"evidence"`

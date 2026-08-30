@@ -32,10 +32,15 @@ func (e *Engine) Diagnose(in model.DiagnoseRequest) model.Report {
 	checkEvents(&report, in.Events)
 	checkLogs(&report, in.Logs)
 	checkResources(&report, pod, in.Resources)
+	report.MissingContext = missingContext(in)
 
 	sort.SliceStable(report.Reasons, func(i, j int) bool {
-		return severityRank(report.Reasons[i].Severity) > severityRank(report.Reasons[j].Severity)
+		return reasonRank(report.Reasons[i]) > reasonRank(report.Reasons[j])
 	})
+	if len(report.Reasons) > 0 {
+		rootCause := report.Reasons[0]
+		report.RootCause = &rootCause
+	}
 	status := "healthy"
 	if len(report.Reasons) > 0 {
 		status = "degraded"
@@ -46,19 +51,25 @@ func (e *Engine) Diagnose(in model.DiagnoseRequest) model.Report {
 			}
 		}
 	}
-	if pod.Status.Phase == "Unknown" || pod.Status.Phase == "" {
-		if len(report.Reasons) == 0 {
-			status = "unknown"
-		}
+	if len(report.MissingContext) > 0 && len(report.Reasons) == 0 {
+		status = "unknown"
+	}
+	if pod.Status.Phase == "Unknown" && len(report.Reasons) == 0 {
+		status = "unknown"
 	}
 	report.Status = status
+	report.Confidence = reportConfidence(report)
 	name := pod.Metadata.Name
 	if name == "" {
 		name = "<unnamed>"
 	}
 	switch len(report.Reasons) {
 	case 0:
-		report.Summary = fmt.Sprintf("Pod %s is healthy based on the supplied state.", name)
+		if status == "unknown" {
+			report.Summary = fmt.Sprintf("Pod %s cannot be classified confidently: context is incomplete.", name)
+		} else {
+			report.Summary = fmt.Sprintf("Pod %s is healthy based on the supplied state.", name)
+		}
 	case 1:
 		report.Summary = fmt.Sprintf("Pod %s is %s: 1 reason found.", name, status)
 	default:
@@ -242,15 +253,49 @@ func checkResources(report *model.Report, pod model.Pod, context model.ResourceC
 	if len(missingRequests) > 0 {
 		addResourceFinding(report, model.ResourceFinding{Code: "missing_requests", Severity: "warning", Title: "Some containers have incomplete resource requests", Explanation: "Without CPU and memory requests, scheduling and quota behavior can be surprising and the pod is harder to size safely.", Evidence: []string{"containers=" + strings.Join(missingRequests, ", ")}})
 	}
+	type nodeCapacityResult struct {
+		name                  string
+		cpuKnown, memoryKnown bool
+		cpuFits, memoryFits   bool
+	}
+	results := []nodeCapacityResult{}
 	for _, node := range context.Nodes {
 		if !node.Schedulable {
 			continue
 		}
-		if node.AvailableCPUMillicores > 0 && requestCPU > node.AvailableCPUMillicores {
-			addResourceFinding(report, model.ResourceFinding{Code: "insufficient_cpu", Severity: "error", Title: "Pod requests more CPU than available", Explanation: "The supplied node context does not have enough available CPU for these requests.", Evidence: []string{fmt.Sprintf("requested=%dm available=%dm node=%s", requestCPU, node.AvailableCPUMillicores, node.Name)}})
+		cpuKnown := node.AvailableCPUMillicores > 0
+		memoryKnown := node.AvailableMemoryBytes > 0
+		if !cpuKnown && !memoryKnown {
+			continue
 		}
-		if node.AvailableMemoryBytes > 0 && requestMemory > node.AvailableMemoryBytes {
-			addResourceFinding(report, model.ResourceFinding{Code: "insufficient_memory", Severity: "error", Title: "Pod requests more memory than available", Explanation: "The supplied node context does not have enough available memory for these requests.", Evidence: []string{fmt.Sprintf("requested=%d available=%d node=%s", requestMemory, node.AvailableMemoryBytes, node.Name)}})
+		results = append(results, nodeCapacityResult{
+			name:        node.Name,
+			cpuKnown:    cpuKnown,
+			memoryKnown: memoryKnown,
+			cpuFits:     !cpuKnown || requestCPU <= node.AvailableCPUMillicores,
+			memoryFits:  !memoryKnown || requestMemory <= node.AvailableMemoryBytes,
+		})
+	}
+	if len(results) > 0 {
+		feasible := false
+		for _, result := range results {
+			if result.cpuFits && result.memoryFits {
+				feasible = true
+				break
+			}
+		}
+		if !feasible {
+			evidence := []string{fmt.Sprintf("requested=%dm cpu, %d bytes memory", requestCPU, requestMemory)}
+			for _, result := range results {
+				evidence = append(evidence, fmt.Sprintf("node=%s cpuFits=%t memoryFits=%t", result.name, result.cpuFits, result.memoryFits))
+			}
+			addResourceFinding(report, model.ResourceFinding{
+				Code:        "no_feasible_node",
+				Severity:    "error",
+				Title:       "No feasible schedulable node found",
+				Explanation: "Every schedulable node in the supplied context fails at least one known resource-capacity check for this pod.",
+				Evidence:    evidence,
+			})
 		}
 	}
 	for _, quota := range context.Quotas {
@@ -264,17 +309,149 @@ func checkResources(report *model.Report, pod model.Pod, context model.ResourceC
 }
 
 func addReason(report *model.Report, reason model.Reason) {
-	for _, existing := range report.Reasons {
-		if existing.Code == reason.Code {
+	if reason.Confidence == "" {
+		reason.Confidence = defaultConfidence(reason.Code)
+	}
+	for i := range report.Reasons {
+		if report.Reasons[i].Code == reason.Code {
+			existing := &report.Reasons[i]
+			existing.Evidence = appendUnique(existing.Evidence, reason.Evidence...)
+			existing.Remediation = appendUnique(existing.Remediation, reason.Remediation...)
+			if severityRank(reason.Severity) > severityRank(existing.Severity) {
+				existing.Severity = reason.Severity
+			}
+			if confidenceRank(reason.Confidence) > confidenceRank(existing.Confidence) {
+				existing.Confidence = reason.Confidence
+			}
 			return
 		}
 	}
 	report.Reasons = append(report.Reasons, reason)
 }
 func addResourceFinding(report *model.Report, finding model.ResourceFinding) {
+	for i := range report.ResourceFindings {
+		if report.ResourceFindings[i].Code == finding.Code {
+			report.ResourceFindings[i].Evidence = appendUnique(report.ResourceFindings[i].Evidence, finding.Evidence...)
+			addReason(report, model.Reason{Code: "resource_" + finding.Code, Severity: finding.Severity, Title: finding.Title, Explanation: finding.Explanation, Evidence: finding.Evidence, Remediation: []string{"Review resource requests, limits, node capacity, and namespace quotas"}})
+			return
+		}
+	}
 	report.ResourceFindings = append(report.ResourceFindings, finding)
 	severity := finding.Severity
 	addReason(report, model.Reason{Code: "resource_" + finding.Code, Severity: severity, Title: finding.Title, Explanation: finding.Explanation, Evidence: finding.Evidence, Remediation: []string{"Review resource requests, limits, node capacity, and namespace quotas"}})
+}
+
+func missingContext(in model.DiagnoseRequest) []string {
+	missing := []string{}
+	if in.Events == nil {
+		missing = append(missing, "events")
+	}
+	if in.Logs == nil {
+		missing = append(missing, "container logs")
+	}
+	if len(in.CollectionErrors) > 0 && !containsString(missing, "container logs") {
+		missing = append(missing, "container logs")
+	}
+	if in.Pod.Status.Phase == "" && len(in.Pod.Status.Conditions) == 0 && len(in.Pod.Status.ContainerStatuses) == 0 && len(in.Pod.Status.InitContainerStatuses) == 0 {
+		missing = append(missing, "pod status")
+	}
+	if in.Pod.Spec.Containers == nil {
+		missing = append(missing, "pod spec.containers")
+	}
+	return missing
+}
+
+func reportConfidence(report model.Report) string {
+	if len(report.MissingContext) > 0 {
+		return "low"
+	}
+	confidence := "high"
+	for _, reason := range report.Reasons {
+		if confidenceRank(reason.Confidence) < confidenceRank(confidence) {
+			confidence = reason.Confidence
+		}
+	}
+	return confidence
+}
+
+func defaultConfidence(code string) string {
+	if strings.HasPrefix(code, "log_") || strings.HasPrefix(code, "condition_") || code == "not_ready" || strings.HasPrefix(code, "resource_") {
+		return "medium"
+	}
+	return "high"
+}
+
+func confidenceRank(confidence string) int {
+	switch confidence {
+	case "high":
+		return 3
+	case "medium":
+		return 2
+	case "low":
+		return 1
+	default:
+		return 0
+	}
+}
+
+// reasonRank puts likely causes before the symptoms they produce. Severity and
+// confidence break ties, so a high-confidence scheduling or resource failure
+// remains ahead of a generic readiness symptom.
+func reasonRank(reason model.Reason) int {
+	return causalWeight(reason.Code)*100 + severityRank(reason.Severity)*10 + confidenceRank(reason.Confidence)
+}
+
+func causalWeight(code string) int {
+	switch code {
+	case "resource_no_feasible_node", "resource_cpu_quota", "resource_memory_quota":
+		return 100
+	case "event_failedscheduling", "event_failedmount", "event_failedattachvolume", "event_failedcreatepodsandbox":
+		return 100
+	case "oom_killed":
+		return 95
+	case "log_dependency_unavailable", "log_config_error", "log_permission_denied":
+		return 90
+	case "log_panic":
+		return 88
+	case "container_config", "container_create", "image_pull", "image_pull_backoff", "invalid_image":
+		return 85
+	case "container_exit":
+		return 75
+	case "pod_failed", "crash_loop":
+		return 70
+	case "not_ready", "event_backoff", "event_unhealthy", "condition_ready", "condition_containersready":
+		return 30
+	default:
+		return 50
+	}
+}
+
+func appendUnique(values []string, additions ...string) []string {
+	for _, addition := range additions {
+		if addition == "" {
+			continue
+		}
+		found := false
+		for _, value := range values {
+			if value == addition {
+				found = true
+				break
+			}
+		}
+		if !found {
+			values = append(values, addition)
+		}
+	}
+	return values
+}
+
+func containsString(values []string, wanted string) bool {
+	for _, value := range values {
+		if value == wanted {
+			return true
+		}
+	}
+	return false
 }
 func severityRank(s string) int {
 	switch s {

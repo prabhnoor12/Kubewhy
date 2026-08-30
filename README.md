@@ -13,10 +13,15 @@ The diagnostic engine is a pure Go package. It does not need a cluster connectio
 
 ```powershell
 go run ./cmd/kubewhy diagnose --file examples/crashloop-request.json
+go run ./cmd/kubewhy diagnose --pod api --namespace payments
+go run ./cmd/kubewhy diagnose --pod api --namespace payments --watch --interval 5s
+go run ./cmd/kubewhy diagnose --file examples/crashloop-request.json --exit-code
 go run ./cmd/kubewhy serve --listen :8080
 ```
 
-The CLI writes human-readable output by default. Add `--json` for machine-readable output.
+The CLI writes human-readable output by default. Add `--json` for machine-readable output. Pod mode is read-only: it uses the current kubeconfig context by default, collects the pod, namespace events, and bounded logs, and supports `--context`, `--kubeconfig`, `--tail`, and `--previous`. Add `--watch` to repeat collection until Ctrl+C; `--interval` defaults to five seconds. Watch mode with `--json` emits newline-delimited JSON reports.
+
+Use `--exit-code` in CI or shell automation. The stable mapping is `0=healthy`, `1=degraded`, `2=broken`, and `3=unknown`.
 
 ## API
 
@@ -51,11 +56,19 @@ The response contains an overall status and summary, ranked reasons, per-contain
 ```json
 {
   "status": "broken",
-  "summary": "Pod payments/api is broken: 2 high-confidence reasons found.",
+  "confidence": "medium",
+  "summary": "Pod payments/api is broken: 2 reasons found.",
+  "rootCause": {
+    "code": "crash_loop",
+    "severity": "critical",
+    "confidence": "high",
+    "title": "Container is crash-looping"
+  },
   "reasons": [
     {
       "code": "crash_loop",
       "severity": "critical",
+      "confidence": "high",
       "title": "Container is crash-looping",
       "explanation": "The api container terminated repeatedly and Kubernetes is backing off restarts.",
       "evidence": ["waiting reason=CrashLoopBackOff", "restartCount=7"],
@@ -64,6 +77,24 @@ The response contains an overall status and summary, ranked reasons, per-contain
   ]
 }
 ```
+
+`confidence` describes how strongly the supplied evidence supports the report. A report with omitted diagnostic inputs is never marked healthy. Instead, it uses `status: "unknown"`, `confidence: "low"`, and lists the missing inputs in `missingContext`; explicitly supplied empty arrays such as `"events": []` mean that collection was performed and found no items.
+
+`rootCause` is the highest-ranked likely cause. The `reasons` array keeps the complete ranked explanation, including symptoms such as readiness failures and restart backoff.
+
+When cluster log collection fails for one or more containers, the collector preserves those failures in `collectionErrors` so the diagnosis remains low-confidence instead of silently treating missing logs as a clean result.
+
+## kubectl plugin
+
+Build the plugin binary and place it on `PATH` next to `kubectl`:
+
+```powershell
+go build -o kubectl-kubewhy.exe ./cmd/kubectl-kubewhy
+kubectl kubewhy diagnose pod/api -n payments
+kubectl kubewhy diagnose pod/api -n payments --watch --interval 5s
+```
+
+The plugin accepts Kubernetes-style `pod/name` and `-n` arguments, then uses the same read-only collector and diagnosis engine as the main binary.
 
 ## Supplying context from kubectl
 

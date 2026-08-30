@@ -1,14 +1,21 @@
 package api
 
 import (
+	"crypto/rand"
 	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
 	"log"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/kubewhy/kubewhy/internal/diagnosis"
 	"github.com/kubewhy/kubewhy/internal/model"
 )
+
+const maxRequestBytes int64 = 5 << 20
 
 type Server struct {
 	engine *diagnosis.Engine
@@ -43,13 +50,31 @@ func (s *Server) diagnose(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer r.Body.Close()
-	var request model.DiagnoseRequest
-	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 5<<20))
-	if err := decoder.Decode(&request); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid request: "+err.Error())
+	if r.ContentLength > maxRequestBytes {
+		writeError(w, http.StatusRequestEntityTooLarge, "request body exceeds 5 MiB limit")
 		return
 	}
-	if request.Pod.Metadata.Name == "" {
+	var request model.DiagnoseRequest
+	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxRequestBytes))
+	if err := decoder.Decode(&request); err != nil {
+		status := http.StatusBadRequest
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			status = http.StatusRequestEntityTooLarge
+		}
+		writeError(w, status, "invalid request: "+err.Error())
+		return
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		if err == nil {
+			writeError(w, http.StatusBadRequest, "invalid request: multiple JSON values are not allowed")
+			return
+		}
+		writeError(w, http.StatusBadRequest, "invalid request: trailing data")
+		return
+	}
+	if strings.TrimSpace(request.Pod.Metadata.Name) == "" {
 		writeError(w, http.StatusBadRequest, "pod.metadata.name is required")
 		return
 	}
@@ -59,16 +84,27 @@ func (s *Server) diagnose(w http.ResponseWriter, r *http.Request) {
 func withJSON(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("X-Content-Type-Options", "nosniff")
 		next.ServeHTTP(w, r)
 	})
 }
 func withRequestID(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if w.Header().Get("X-Request-ID") == "" {
-			w.Header().Set("X-Request-ID", time.Now().UTC().Format("20060102T150405.000000000Z"))
+		requestID := strings.TrimSpace(r.Header.Get("X-Request-ID"))
+		if requestID == "" || len(requestID) > 128 || strings.ContainsAny(requestID, "\r\n") {
+			requestID = newRequestID()
 		}
+		w.Header().Set("X-Request-ID", requestID)
 		next.ServeHTTP(w, r)
 	})
+}
+
+func newRequestID() string {
+	var bytes [16]byte
+	if _, err := rand.Read(bytes[:]); err == nil {
+		return fmt.Sprintf("%x", bytes)
+	}
+	return fmt.Sprintf("%d", time.Now().UTC().UnixNano())
 }
 func writeJSON(w http.ResponseWriter, status int, value any) {
 	w.WriteHeader(status)

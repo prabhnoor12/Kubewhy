@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"net"
 	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 )
@@ -58,5 +60,46 @@ func TestDiagnoseRejectsMissingPodName(t *testing.T) {
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusBadRequest {
 		t.Fatalf("status = %d", response.StatusCode)
+	}
+}
+
+func TestDiagnoseRejectsTrailingJSON(t *testing.T) {
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/diagnose", strings.NewReader(`{"pod":{"metadata":{"name":"api"}}} {}`))
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	NewServer(nil, nil).Handler().ServeHTTP(response, request)
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d", response.Code, http.StatusBadRequest)
+	}
+}
+
+func TestDiagnoseRejectsOversizedBody(t *testing.T) {
+	body := bytes.NewBufferString(`{"pod":{"metadata":{"name":"api"}},"logs":[{"container":"api","text":"`)
+	_, _ = body.Write(bytes.Repeat([]byte{'x'}, int(maxRequestBytes)))
+	_, _ = body.WriteString(`"}]}`)
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/diagnose", body)
+	response := httptest.NewRecorder()
+	NewServer(nil, nil).Handler().ServeHTTP(response, request)
+	if response.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = %d, want %d", response.Code, http.StatusRequestEntityTooLarge)
+	}
+}
+
+func TestRequestIDPropagatesIncomingID(t *testing.T) {
+	request := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+	request.Header.Set("X-Request-ID", "incident-123")
+	response := httptest.NewRecorder()
+	NewServer(nil, nil).Handler().ServeHTTP(response, request)
+	if got := response.Header().Get("X-Request-ID"); got != "incident-123" {
+		t.Fatalf("X-Request-ID = %q, want incident-123", got)
+	}
+}
+
+func TestRequestIDIsGeneratedWhenMissing(t *testing.T) {
+	request := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+	response := httptest.NewRecorder()
+	NewServer(nil, nil).Handler().ServeHTTP(response, request)
+	if response.Header().Get("X-Request-ID") == "" {
+		t.Fatal("expected generated X-Request-ID")
 	}
 }
