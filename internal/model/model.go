@@ -140,6 +140,7 @@ type Report struct {
 	Status           string             `json:"status"`
 	Confidence       string             `json:"confidence"`
 	MissingContext   []string           `json:"missingContext,omitempty"`
+	CollectionErrors []string           `json:"collectionErrors,omitempty"`
 	Summary          string             `json:"summary"`
 	RootCause        *Reason            `json:"rootCause,omitempty"`
 	Reasons          []Reason           `json:"reasons"`

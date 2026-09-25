@@ -1,0 +1,107 @@
+{
+  "name": "kubewhy-vscode",
+  "displayName": "Kubewhy",
+  "description": "Explains why a Kubernetes pod is unhealthy, right in your editor",
+  "version": "0.1.0",
+  "publisher": "kubewhy",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/kubewhy/kubewhy"
+  },
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other",
+    "Debuggers"
+  ],
+  "keywords": [
+    "kubernetes",
+    "k8s",
+    "debugging",
+    "diagnostics",
+    "pods"
+  ],
+  "activationEvents": [
+    "onCommand:kubewhy.diagnose",
+    "onCommand:kubewhy.explain",
+    "onCommand:kubewhy.watch",
+    "onView:kubewhy.history"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "kubewhy.diagnose",
+        "title": "Kubewhy: Diagnose Pod"
+      },
+      {
+        "command": "kubewhy.explain",
+        "title": "Kubewhy: Explain Pod with LLM"
+      },
+      {
+        "command": "kubewhy.watch",
+        "title": "Kubewhy: Watch Pod"
+      },
+      {
+        "command": "kubewhy.refreshHistory",
+        "title": "Kubewhy: Refresh History",
+        "icon": "$(refresh)"
+      }
+    ],
+    "views": {
+      "explorer": [
+        {
+          "id": "kubewhy.history",
+          "name": "Kubewhy History",
+          "icon": "$(pulse)"
+        }
+      ]
+    },
+    "menus": {
+      "view/title": [
+        {
+          "command": "kubewhy.refreshHistory",
+          "when": "view == kubewhy.history",
+          "group": "navigation"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Kubewhy",
+      "properties": {
+        "kubewhy.cliPath": {
+          "type": "string",
+          "default": "kubewhy",
+          "description": "Path to the kubewhy binary"
+        },
+        "kubewhy.defaultNamespace": {
+          "type": "string",
+          "default": "default",
+          "description": "Default namespace for diagnoses"
+        },
+        "kubewhy.context": {
+          "type": "string",
+          "default": "",
+          "description": "Kubeconfig context to use (empty = current context)"
+        },
+        "kubewhy.historyLimit": {
+          "type": "number",
+          "default": 50,
+          "description": "Maximum history entries to show in the tree view"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/vscode": "^1.85.0",
+    "typescript": "^5.3.0"
+  }
+}

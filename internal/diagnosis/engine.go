@@ -17,6 +17,7 @@ func NewEngine() *Engine { return &Engine{} }
 
 func (e *Engine) Diagnose(in model.DiagnoseRequest) model.Report {
 	pod := in.Pod
+	validateRequest(&in)
 	report := model.Report{
 		GeneratedAt: time.Now().UTC(),
 		Pod: model.PodIdentity{
@@ -25,6 +26,7 @@ func (e *Engine) Diagnose(in model.DiagnoseRequest) model.Report {
 		},
 		Reasons: []model.Reason{}, Containers: []model.ContainerFinding{},
 		RelevantEvents: []model.EventFinding{}, ResourceFindings: []model.ResourceFinding{},
+		CollectionErrors: in.CollectionErrors,
 	}
 
 	checkPodState(&report, pod)
@@ -362,7 +364,7 @@ func missingContext(in model.DiagnoseRequest) []string {
 }
 
 func reportConfidence(report model.Report) string {
-	if len(report.MissingContext) > 0 {
+	if len(report.MissingContext) > 0 || len(report.CollectionErrors) > 0 {
 		return "low"
 	}
 	confidence := "high"
@@ -505,5 +507,38 @@ func remediationForReason(reason string) []string {
 		return []string{"Correct the image repository, tag, and registry syntax"}
 	default:
 		return []string{"Inspect kubelet and runtime details for the container"}
+	}
+}
+
+func validateRequest(in *model.DiagnoseRequest) {
+	for i := range in.Pod.Status.ContainerStatuses {
+		validateContainerStatus(&in.Pod.Status.ContainerStatuses[i])
+	}
+	for i := range in.Pod.Status.InitContainerStatuses {
+		validateContainerStatus(&in.Pod.Status.InitContainerStatuses[i])
+	}
+	for i := range in.Events {
+		if in.Events[i].Count < 0 {
+			in.Events[i].Count = 0
+		}
+	}
+	for i := range in.Pod.Spec.Containers {
+		if in.Pod.Spec.Containers[i].Name == "" {
+			in.Pod.Spec.Containers[i].Name = fmt.Sprintf("container-%d", i)
+		}
+	}
+	for i := range in.Pod.Spec.InitContainers {
+		if in.Pod.Spec.InitContainers[i].Name == "" {
+			in.Pod.Spec.InitContainers[i].Name = fmt.Sprintf("init-container-%d", i)
+		}
+	}
+}
+
+func validateContainerStatus(status *model.ContainerStatus) {
+	if status.RestartCount < 0 {
+		status.RestartCount = 0
+	}
+	if status.Name == "" {
+		status.Name = "unknown"
 	}
 }

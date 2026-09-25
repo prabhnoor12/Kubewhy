@@ -1,0 +1,49 @@
+version: 2
+
+before:
+  hooks:
+    - go test ./...
+
+builds:
+  - id: kubewhy
+    main: ./cmd/kubewhy
+    binary: kubewhy
+    env:
+      - CGO_ENABLED=0
+    goos: [linux, darwin, windows]
+    goarch: [amd64, arm64]
+
+  - id: kubectl-kubewhy
+    main: ./cmd/kubectl-kubewhy
+    binary: kubectl-kubewhy
+    env:
+      - CGO_ENABLED=0
+    goos: [linux, darwin, windows]
+    goarch: [amd64, arm64]
+
+archives:
+  - id: kubewhy
+    ids: [kubewhy]
+    name_template: "kubewhy_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    formats: [tar.gz]
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+
+  - id: kubectl-kubewhy
+    ids: [kubectl-kubewhy]
+    name_template: "kubectl-kubewhy_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    formats: [tar.gz]
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+
+checksum:
+  name_template: checksums.txt
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
