@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
@@ -253,4 +254,108 @@ func formatTime(value time.Time) string {
 		return ""
 	}
 	return value.UTC().Format(time.RFC3339)
+}
+
+func (c *Collector) CollectWithDeployment(ctx context.Context, namespace, podName string, options Options) (model.DiagnoseRequest, error) {
+	request, err := c.Collect(ctx, namespace, podName, options)
+	if err != nil {
+		return request, err
+	}
+	pod, err := c.client.CoreV1().Pods(namespace).Get(ctx, podName, metav1.GetOptions{})
+	if err != nil {
+		return request, nil
+	}
+	info := c.resolveDeployment(ctx, namespace, pod.OwnerReferences)
+	if info != nil {
+		request.Deployment = info
+	}
+	return request, nil
+}
+
+func (c *Collector) resolveDeployment(ctx context.Context, namespace string, ownerRefs []metav1.OwnerReference) *model.DeploymentInfo {
+	for _, ref := range ownerRefs {
+		if ref.Kind != "ReplicaSet" {
+			continue
+		}
+		rs, err := c.client.AppsV1().ReplicaSets(namespace).Get(ctx, ref.Name, metav1.GetOptions{})
+		if err != nil {
+			return nil
+		}
+		for _, rsOwner := range rs.OwnerReferences {
+			if rsOwner.Kind != "Deployment" {
+				continue
+			}
+			dep, err := c.client.AppsV1().Deployments(namespace).Get(ctx, rsOwner.Name, metav1.GetOptions{})
+			if err != nil {
+				return nil
+			}
+			return deploymentInfo(dep, rs)
+		}
+	}
+	return nil
+}
+
+func deploymentInfo(dep *appsv1.Deployment, rs *appsv1.ReplicaSet) *model.DeploymentInfo {
+	revision := dep.Annotations["deployment.kubernetes.io/revision"]
+	activeRollout := dep.Status.UpdatedReplicas < dep.Status.Replicas || dep.Status.ObservedGeneration < dep.Generation
+	info := &model.DeploymentInfo{
+		Name:            dep.Name,
+		Namespace:       dep.Namespace,
+		ActiveRollout:   activeRollout,
+		CurrentRevision: revision,
+	}
+	if len(dep.Status.Conditions) > 0 {
+		last := dep.Status.Conditions[len(dep.Status.Conditions)-1]
+		info.LastTransitionTime = last.LastTransitionTime.Time
+	}
+	return info
+}
+
+func (c *Collector) CollectNamespace(ctx context.Context, namespace string, options Options) ([]model.DiagnoseRequest, error) {
+	if c == nil || c.client == nil {
+		return nil, fmt.Errorf("Kubernetes client is not configured")
+	}
+	if namespace == "" {
+		namespace = "default"
+	}
+	pods, err := c.client.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("list pods in %s: %w", namespace, err)
+	}
+	var requests []model.DiagnoseRequest
+	for i := range pods.Items {
+		pod := &pods.Items[i]
+		if !isUnhealthy(pod) {
+			continue
+		}
+		req, err := c.Collect(ctx, namespace, pod.Name, options)
+		if err != nil {
+			continue
+		}
+		requests = append(requests, req)
+	}
+	return requests, nil
+}
+
+func isUnhealthy(pod *corev1.Pod) bool {
+	if pod.Status.Phase != "" && pod.Status.Phase != "Running" && pod.Status.Phase != "Succeeded" {
+		return true
+	}
+	for _, cs := range pod.Status.ContainerStatuses {
+		if !cs.Ready {
+			return true
+		}
+		if cs.State.Waiting != nil && cs.State.Waiting.Reason != "" {
+			return true
+		}
+	}
+	return false
+}
+
+func (c *Collector) ListPodCount(ctx context.Context, namespace string) (int, error) {
+	pods, err := c.client.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return 0, err
+	}
+	return len(pods.Items), nil
 }

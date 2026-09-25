@@ -137,3 +137,17 @@ func matchesFilter(entry Entry, filter Filter) bool {
 	}
 	return true
 }
+
+func (s *Store) QueryByPattern(pod, namespace, rootCauseCode string, since time.Time) ([]Entry, error) {
+	entries, err := s.Query(Filter{Pod: pod, Namespace: namespace, Since: since})
+	if err != nil {
+		return nil, err
+	}
+	var matched []Entry
+	for _, entry := range entries {
+		if entry.Report.RootCause != nil && entry.Report.RootCause.Code == rootCauseCode {
+			matched = append(matched, entry)
+		}
+	}
+	return matched, nil
+}

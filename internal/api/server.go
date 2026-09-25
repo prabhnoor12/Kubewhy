@@ -28,6 +28,38 @@ const requestIDKey contextKey = "requestID"
 
 const maxRequestBytes int64 = 5 << 20
 
+var (
+	metricsOnce sync.Once
+
+	diagnosisDuration = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "kubewhy_diagnosis_duration_seconds",
+			Help:    "Time taken to complete a diagnosis",
+			Buckets: prometheus.DefBuckets,
+		},
+		[]string{"status", "confidence"},
+	)
+	diagnosisRequests = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "kubewhy_diagnosis_requests_total",
+			Help: "Total number of diagnosis requests",
+		},
+		[]string{"status"},
+	)
+	collectionErrorsCounter = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Name: "kubewhy_collection_errors_total",
+			Help: "Total number of collection errors",
+		},
+	)
+)
+
+func registerMetrics() {
+	metricsOnce.Do(func() {
+		prometheus.MustRegister(diagnosisDuration, diagnosisRequests, collectionErrorsCounter)
+	})
+}
+
 type ipLimiter struct {
 	limiters map[string]*rate.Limiter
 	mu       sync.RWMutex
@@ -113,29 +145,7 @@ func NewServer(engine *diagnosis.Engine, logger *slog.Logger) *Server {
 		logger = slog.Default()
 	}
 
-	diagnosisDuration := prometheus.NewHistogramVec(
-		prometheus.HistogramOpts{
-			Name:    "kubewhy_diagnosis_duration_seconds",
-			Help:    "Time taken to complete a diagnosis",
-			Buckets: prometheus.DefBuckets,
-		},
-		[]string{"status", "confidence"},
-	)
-	diagnosisRequests := prometheus.NewCounterVec(
-		prometheus.CounterOpts{
-			Name: "kubewhy_diagnosis_requests_total",
-			Help: "Total number of diagnosis requests",
-		},
-		[]string{"status"},
-	)
-	collectionErrors := prometheus.NewCounter(
-		prometheus.CounterOpts{
-			Name: "kubewhy_collection_errors_total",
-			Help: "Total number of collection errors",
-		},
-	)
-
-	prometheus.MustRegister(diagnosisDuration, diagnosisRequests, collectionErrors)
+	registerMetrics()
 
 	rateLimiter := newIPLimiter(rate.Limit(10), 20)
 
@@ -144,7 +154,7 @@ func NewServer(engine *diagnosis.Engine, logger *slog.Logger) *Server {
 		logger:             logger,
 		diagnosisDuration:  diagnosisDuration,
 		diagnosisRequests:  diagnosisRequests,
-		collectionErrors:   collectionErrors,
+		collectionErrors:   collectionErrorsCounter,
 		rateLimiter:        rateLimiter,
 	}
 }

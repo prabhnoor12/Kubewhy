@@ -24,6 +24,21 @@ func BuildPrompt(report model.Report) []Message {
 	}
 }
 
+const simpleSystemPrompt = `You are a Kubernetes debugging assistant. The user is new to Kubernetes and needs a very simple explanation.
+
+Your task:
+1. Explain what is wrong in 2-3 sentences using plain language a beginner would understand.
+2. Avoid jargon. If you must use a technical term, explain it briefly.
+3. Give exactly one action the user should take, as a simple step.
+4. Do not include kubectl commands unless absolutely necessary, and if you do, explain what each part means.`
+
+func BuildPromptSimple(report model.Report) []Message {
+	return []Message{
+		{Role: "system", Content: simpleSystemPrompt},
+		{Role: "user", Content: buildUserContent(report)},
+	}
+}
+
 func buildUserContent(report model.Report) string {
 	var b strings.Builder
 

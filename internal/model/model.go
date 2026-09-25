@@ -11,6 +11,7 @@ type DiagnoseRequest struct {
 	Logs             []ContainerLog  `json:"logs,omitempty"`
 	CollectionErrors []string        `json:"collectionErrors,omitempty"`
 	Resources        ResourceContext `json:"resources,omitempty"`
+	Deployment       *DeploymentInfo `json:"deployment,omitempty"`
 }
 
 type Pod struct {
@@ -135,18 +136,20 @@ type QuotaStatus struct {
 }
 
 type Report struct {
-	GeneratedAt      time.Time          `json:"generatedAt"`
-	Pod              PodIdentity        `json:"pod"`
-	Status           string             `json:"status"`
-	Confidence       string             `json:"confidence"`
-	MissingContext   []string           `json:"missingContext,omitempty"`
-	CollectionErrors []string           `json:"collectionErrors,omitempty"`
-	Summary          string             `json:"summary"`
-	RootCause        *Reason            `json:"rootCause,omitempty"`
-	Reasons          []Reason           `json:"reasons"`
-	Containers       []ContainerFinding `json:"containers"`
-	RelevantEvents   []EventFinding     `json:"relevantEvents"`
-	ResourceFindings []ResourceFinding  `json:"resourceFindings"`
+	GeneratedAt        time.Time            `json:"generatedAt"`
+	Pod                PodIdentity          `json:"pod"`
+	Status             string               `json:"status"`
+	Confidence         string               `json:"confidence"`
+	MissingContext     []string             `json:"missingContext,omitempty"`
+	CollectionErrors   []string             `json:"collectionErrors,omitempty"`
+	Summary            string               `json:"summary"`
+	RootCause          *Reason              `json:"rootCause,omitempty"`
+	Reasons            []Reason             `json:"reasons"`
+	Containers         []ContainerFinding   `json:"containers"`
+	RelevantEvents     []EventFinding       `json:"relevantEvents"`
+	ResourceFindings   []ResourceFinding    `json:"resourceFindings"`
+	PreviousOccurrences []PreviousOccurrence `json:"previousOccurrences,omitempty"`
+	DeploymentContext  *DeploymentInfo      `json:"deploymentContext,omitempty"`
 }
 
 type PodIdentity struct {
@@ -158,13 +161,16 @@ type PodIdentity struct {
 }
 
 type Reason struct {
-	Code        string   `json:"code"`
-	Severity    string   `json:"severity"`
-	Confidence  string   `json:"confidence"`
-	Title       string   `json:"title"`
-	Explanation string   `json:"explanation"`
-	Evidence    []string `json:"evidence"`
-	Remediation []string `json:"remediation"`
+	Code           string   `json:"code"`
+	Severity       string   `json:"severity"`
+	Confidence     string   `json:"confidence"`
+	Title          string   `json:"title"`
+	Explanation    string   `json:"explanation"`
+	Evidence       []string `json:"evidence"`
+	Remediation    []string `json:"remediation"`
+	ChainedFrom    []string `json:"chainedFrom,omitempty"`
+	CorroboratedBy []string `json:"corroboratedBy,omitempty"`
+	RunbookURL     string   `json:"runbookUrl,omitempty"`
 }
 
 type ContainerFinding struct {
@@ -190,4 +196,35 @@ type ResourceFinding struct {
 	Title       string   `json:"title"`
 	Explanation string   `json:"explanation"`
 	Evidence    []string `json:"evidence"`
+}
+
+type PreviousOccurrence struct {
+	Timestamp     time.Time `json:"timestamp"`
+	Status        string    `json:"status"`
+	RootCauseCode string    `json:"rootCauseCode"`
+}
+
+type DeploymentInfo struct {
+	Name               string    `json:"name"`
+	Namespace          string    `json:"namespace"`
+	ActiveRollout      bool      `json:"activeRollout"`
+	CurrentRevision    string    `json:"currentRevision,omitempty"`
+	PreviousRevision   string    `json:"previousRevision,omitempty"`
+	LastTransitionTime time.Time `json:"lastTransitionTime,omitempty"`
+}
+
+type WorkloadReport struct {
+	GeneratedAt    time.Time    `json:"generatedAt"`
+	Namespace      string       `json:"namespace"`
+	TotalPods      int          `json:"totalPods"`
+	HealthyCount   int          `json:"healthyCount"`
+	UnhealthyCount int          `json:"unhealthyCount"`
+	CommonCauses   []CauseCount `json:"commonCauses"`
+	Reports        []Report     `json:"reports"`
+}
+
+type CauseCount struct {
+	Code  string `json:"code"`
+	Title string `json:"title"`
+	Count int    `json:"count"`
 }

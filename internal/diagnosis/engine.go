@@ -2,16 +2,20 @@ package diagnosis
 
 import (
 	"fmt"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
 
 	"github.com/kubewhy/kubewhy/internal/model"
+	"github.com/kubewhy/kubewhy/internal/runbook"
 )
 
 // Engine correlates pod state, events, logs, and resource context into an
 // explanation. It has no Kubernetes client dependency by design.
-type Engine struct{}
+type Engine struct {
+	Runbooks *runbook.Mapping
+}
 
 func NewEngine() *Engine { return &Engine{} }
 
@@ -31,14 +35,25 @@ func (e *Engine) Diagnose(in model.DiagnoseRequest) model.Report {
 
 	checkPodState(&report, pod)
 	checkContainers(&report, pod)
+	checkInitContainerChain(&report, pod)
+	analyzeRestartPatterns(&report, pod)
 	checkEvents(&report, in.Events)
 	checkLogs(&report, in.Logs)
 	checkResources(&report, pod, in.Resources)
+	calibrateConfidence(&report)
+	enrichRemediation(&report, in)
 	report.MissingContext = missingContext(in)
 
 	sort.SliceStable(report.Reasons, func(i, j int) bool {
 		return reasonRank(report.Reasons[i]) > reasonRank(report.Reasons[j])
 	})
+	if e.Runbooks != nil {
+		for i := range report.Reasons {
+			if url := e.Runbooks.Lookup(report.Reasons[i].Code); url != "" {
+				report.Reasons[i].RunbookURL = url
+			}
+		}
+	}
 	if len(report.Reasons) > 0 {
 		rootCause := report.Reasons[0]
 		report.RootCause = &rootCause
@@ -213,7 +228,14 @@ func checkLogs(report *model.Report, logs []model.ContainerLog) {
 			if log.Previous {
 				which += " previous=true"
 			}
-			addReason(report, model.Reason{Code: "log_" + pattern.code, Severity: pattern.severity, Title: pattern.title, Explanation: pattern.explanation, Evidence: []string{which, "matched=" + matched}, Remediation: pattern.remediation})
+			evidence := []string{which, "matched=" + matched}
+			remediation := pattern.remediation
+			if pattern.code == "dependency_unavailable" {
+				if dep := extractDependency(log.Text); dep != "" {
+					evidence = append(evidence, "dependency="+dep)
+				}
+			}
+			addReason(report, model.Reason{Code: "log_" + pattern.code, Severity: pattern.severity, Title: pattern.title, Explanation: pattern.explanation, Evidence: evidence, Remediation: remediation})
 		}
 	}
 }
@@ -308,6 +330,233 @@ func checkResources(report *model.Report, pod model.Pod, context model.ResourceC
 			addResourceFinding(report, model.ResourceFinding{Code: "memory_quota", Severity: "error", Title: "Pod would exceed memory quota", Explanation: "The namespace quota has less memory headroom than this pod requests.", Evidence: []string{fmt.Sprintf("quota=%s used=%d requested=%d hard=%d", quota.Name, quota.UsedMemoryBytes, requestMemory, quota.HardMemoryBytes)}})
 		}
 	}
+}
+
+var dependencyPatterns = []*regexp.Regexp{
+	regexp.MustCompile(`(?i)dial tcp (\S+:\d+)`),
+	regexp.MustCompile(`(?i)connection refused (?:to )?(\S+)`),
+	regexp.MustCompile(`(?i)no such host:?\s+(\S+)`),
+	regexp.MustCompile(`(?i)i/o timeout connecting to (\S+)`),
+	regexp.MustCompile(`(?i)failed to connect to (\S+)`),
+	regexp.MustCompile(`(?i)lookup (\S+):`),
+}
+
+func extractDependency(text string) string {
+	for _, pattern := range dependencyPatterns {
+		matches := pattern.FindStringSubmatch(text)
+		if len(matches) >= 2 {
+			return strings.TrimRight(matches[1], ".,;:)")
+		}
+	}
+	return ""
+}
+
+func checkInitContainerChain(report *model.Report, pod model.Pod) {
+	var failedInit string
+	for _, status := range pod.Status.InitContainerStatuses {
+		if status.State.Terminated != nil && status.State.Terminated.ExitCode != 0 {
+			failedInit = status.Name
+			break
+		}
+		if status.State.Waiting != nil && status.State.Waiting.Reason != "" {
+			failedInit = status.Name
+			break
+		}
+	}
+	if failedInit == "" {
+		return
+	}
+	stuckApp := []string{}
+	for _, status := range pod.Status.ContainerStatuses {
+		if status.State.Waiting != nil {
+			r := status.State.Waiting.Reason
+			if r == "PodInitializing" || r == "ContainerCreating" {
+				stuckApp = append(stuckApp, status.Name)
+			}
+		}
+	}
+	if len(stuckApp) == 0 {
+		return
+	}
+	for i := range report.Reasons {
+		for _, ev := range report.Reasons[i].Evidence {
+			if strings.HasPrefix(ev, "container="+failedInit) {
+				for _, app := range stuckApp {
+					report.Reasons[i].Evidence = appendUnique(report.Reasons[i].Evidence, "chained: app container "+app+" stuck waiting for init container "+failedInit)
+				}
+				report.Reasons[i].ChainedFrom = appendUnique(report.Reasons[i].ChainedFrom, failedInit)
+				break
+			}
+		}
+	}
+	symptomCodes := map[string]bool{"condition_containersready": true, "condition_ready": true}
+	filtered := report.Reasons[:0]
+	for _, reason := range report.Reasons {
+		if symptomCodes[reason.Code] {
+			isSymptom := false
+			for _, ev := range reason.Evidence {
+				for _, app := range stuckApp {
+					if strings.Contains(ev, "container="+app) {
+						isSymptom = true
+						break
+					}
+				}
+				if isSymptom {
+					break
+				}
+			}
+			if isSymptom {
+				continue
+			}
+		}
+		filtered = append(filtered, reason)
+	}
+	report.Reasons = filtered
+}
+
+func analyzeRestartPatterns(report *model.Report, pod model.Pod) {
+	allStatuses := append(pod.Status.InitContainerStatuses, pod.Status.ContainerStatuses...)
+	for _, status := range allStatuses {
+		if status.RestartCount <= 0 || status.LastState.Terminated == nil {
+			continue
+		}
+		t := status.LastState.Terminated
+		if t.StartedAt == nil || t.FinishedAt == nil {
+			continue
+		}
+		runDuration := t.FinishedAt.Sub(*t.StartedAt)
+		switch {
+		case runDuration <= 30*time.Second:
+			addReason(report, model.Reason{
+				Code: "restart_rapid", Severity: "error",
+				Title:       "Container restarts rapidly (startup failure)",
+				Explanation: fmt.Sprintf("Container %s restarts within %s, indicating a startup failure rather than a runtime issue.", status.Name, runDuration.Round(time.Second)),
+				Evidence:    []string{"container=" + status.Name, fmt.Sprintf("runDuration=%s", runDuration.Round(time.Second)), fmt.Sprintf("restartCount=%d", status.RestartCount)},
+				Remediation: []string{"Check startup dependencies and configuration", "Verify the container command and arguments are correct"},
+			})
+		case t.Reason == "OOMKilled" && runDuration > time.Hour:
+			addReason(report, model.Reason{
+				Code: "restart_creep", Severity: "error",
+				Title:       "Container dies slowly (possible memory leak)",
+				Explanation: fmt.Sprintf("Container %s ran for %s before being OOMKilled, suggesting gradual memory exhaustion.", status.Name, runDuration.Round(time.Minute)),
+				Evidence:    []string{"container=" + status.Name, fmt.Sprintf("runDuration=%s", runDuration.Round(time.Minute)), "terminationReason=OOMKilled", fmt.Sprintf("restartCount=%d", status.RestartCount)},
+				Remediation: []string{"Profile memory usage over time", "Check for memory leaks or unexpectedly large input"},
+			})
+		case runDuration > 24*time.Hour && t.ExitCode != 0 && t.Reason != "OOMKilled":
+			addReason(report, model.Reason{
+				Code: "restart_after_stable", Severity: "warning",
+				Title:       "Container restarted after long stable period",
+				Explanation: fmt.Sprintf("Container %s was stable for %s before restarting, suggesting an external trigger.", status.Name, runDuration.Round(time.Hour)),
+				Evidence:    []string{"container=" + status.Name, fmt.Sprintf("runDuration=%s", runDuration.Round(time.Hour)), fmt.Sprintf("exitCode=%d", t.ExitCode), fmt.Sprintf("restartCount=%d", status.RestartCount)},
+				Remediation: []string{"Check for recent config changes or deployments", "Review external dependency health around the restart time"},
+			})
+		}
+	}
+}
+
+func calibrateConfidence(report *model.Report) {
+	codeIndex := map[string]int{}
+	for i, r := range report.Reasons {
+		codeIndex[r.Code] = i
+	}
+	groups := [][]string{
+		{"crash_loop", "event_backoff"},
+		{"oom_killed", "log_panic"},
+		{"log_dependency_unavailable", "condition_ready"},
+		{"log_config_error", "container_config"},
+		{"resource_no_feasible_node", "event_failedscheduling"},
+	}
+	for _, group := range groups {
+		present := []int{}
+		for _, code := range group {
+			if idx, ok := codeIndex[code]; ok {
+				present = append(present, idx)
+			}
+		}
+		if len(present) >= 2 {
+			for _, idx := range present {
+				others := []string{}
+				for _, other := range group {
+					if other != report.Reasons[idx].Code {
+						if _, exists := codeIndex[other]; exists {
+							others = append(others, other)
+						}
+					}
+				}
+				report.Reasons[idx].CorroboratedBy = appendUnique(report.Reasons[idx].CorroboratedBy, others...)
+				if confidenceRank(report.Reasons[idx].Confidence) < confidenceRank("high") {
+					report.Reasons[idx].Confidence = boostConfidence(report.Reasons[idx].Confidence)
+				}
+			}
+		}
+	}
+	for i := range report.Reasons {
+		if len(report.Reasons[i].Evidence) >= 3 && confidenceRank(report.Reasons[i].Confidence) < confidenceRank("high") {
+			report.Reasons[i].Confidence = boostConfidence(report.Reasons[i].Confidence)
+		}
+	}
+}
+
+func boostConfidence(current string) string {
+	switch current {
+	case "low":
+		return "medium"
+	case "medium":
+		return "high"
+	default:
+		return "high"
+	}
+}
+
+func enrichRemediation(report *model.Report, in model.DiagnoseRequest) {
+	ns := in.Pod.Metadata.Namespace
+	podName := in.Pod.Metadata.Name
+	for i := range report.Reasons {
+		r := &report.Reasons[i]
+		switch {
+		case r.Code == "oom_killed":
+			for _, c := range in.Pod.Spec.Containers {
+				if mem, ok := c.Resources.Limits["memory"]; ok {
+					r.Remediation = appendUnique(r.Remediation, "current memory limit: "+mem+"; consider increasing after profiling actual usage")
+				}
+			}
+		case r.Code == "log_dependency_unavailable":
+			for _, ev := range r.Evidence {
+				if strings.HasPrefix(ev, "dependency=") {
+					dep := strings.TrimPrefix(ev, "dependency=")
+					host := strings.Split(dep, ":")[0]
+					r.Remediation = appendUnique(r.Remediation, "kubectl get endpoints "+host+" -n "+ns)
+					r.Remediation = appendUnique(r.Remediation, "kubectl exec "+podName+" -n "+ns+" -- nslookup "+host)
+				}
+			}
+		case r.Code == "image_pull" || r.Code == "image_pull_backoff":
+			r.Remediation = appendUnique(r.Remediation, "kubectl describe pod "+podName+" -n "+ns)
+		case strings.HasPrefix(r.Code, "resource_"):
+			for _, c := range in.Pod.Spec.Containers {
+				if cpu, ok := c.Resources.Requests["cpu"]; ok {
+					r.Remediation = appendUnique(r.Remediation, "current CPU request for "+c.Name+": "+cpu)
+				}
+				if mem, ok := c.Resources.Requests["memory"]; ok {
+					r.Remediation = appendUnique(r.Remediation, "current memory request for "+c.Name+": "+mem)
+				}
+			}
+		}
+		sortRemediation(r)
+	}
+}
+
+func sortRemediation(r *model.Reason) {
+	quick := []string{}
+	structural := []string{}
+	for _, item := range r.Remediation {
+		lower := strings.ToLower(item)
+		if strings.HasPrefix(lower, "kubectl get") || strings.HasPrefix(lower, "kubectl describe") || strings.HasPrefix(lower, "kubectl exec") || strings.HasPrefix(lower, "inspect") || strings.HasPrefix(lower, "check") || strings.HasPrefix(lower, "verify") || strings.HasPrefix(lower, "profile") {
+			quick = append(quick, item)
+		} else {
+			structural = append(structural, item)
+		}
+	}
+	r.Remediation = append(quick, structural...)
 }
 
 func addReason(report *model.Report, reason model.Reason) {
@@ -419,6 +668,12 @@ func causalWeight(code string) int {
 		return 85
 	case "container_exit":
 		return 75
+	case "restart_rapid":
+		return 73
+	case "restart_creep":
+		return 72
+	case "restart_after_stable":
+		return 71
 	case "pod_failed", "crash_loop":
 		return 70
 	case "not_ready", "event_backoff", "event_unhealthy", "condition_ready", "condition_containersready":

@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -19,8 +20,10 @@ import (
 	"github.com/kubewhy/kubewhy/internal/collector"
 	"github.com/kubewhy/kubewhy/internal/diagnosis"
 	"github.com/kubewhy/kubewhy/internal/history"
+	"github.com/kubewhy/kubewhy/internal/integrations"
 	"github.com/kubewhy/kubewhy/internal/llm"
 	"github.com/kubewhy/kubewhy/internal/model"
+	"github.com/kubewhy/kubewhy/internal/runbook"
 )
 
 func Run(args []string) {
@@ -31,6 +34,8 @@ func Run(args []string) {
 	switch args[0] {
 	case "diagnose":
 		runDiagnose(args[1:])
+	case "diagnose-namespace":
+		runDiagnoseNamespace(args[1:])
 	case "serve":
 		runServe(args[1:])
 	case "history":
@@ -62,7 +67,22 @@ func runDiagnose(args []string) {
 	llmURL := flags.String("llm-url", "", "LLM API base URL; overrides KUBEWHY_LLM_BASE_URL")
 	llmKey := flags.String("llm-key", "", "LLM API key; overrides KUBEWHY_LLM_API_KEY")
 	llmModel := flags.String("llm-model", "", "LLM model name; overrides KUBEWHY_LLM_MODEL")
+	runbooksPath := flags.String("runbooks", "", "path to runbook mapping JSON file")
+	simple := flags.Bool("simple", false, "show a plain-language explanation for beginners")
+	slackWebhook := flags.String("slack-webhook", "", "Slack webhook URL for notifications (or KUBEWHY_SLACK_WEBHOOK)")
+	pagerdutyKey := flags.String("pagerduty-key", "", "PagerDuty routing key for alerts (or KUBEWHY_PAGERDUTY_KEY)")
 	_ = flags.Parse(args)
+
+	notifiers := buildNotifiers(*slackWebhook, *pagerdutyKey)
+
+	engine := diagnosis.NewEngine()
+	if *runbooksPath != "" {
+		mapping, err := runbook.LoadMapping(*runbooksPath)
+		if err != nil {
+			fatal(err)
+		}
+		engine.Runbooks = mapping
+	}
 
 	if *podRef != "" {
 		if *file != "" {
@@ -85,7 +105,7 @@ func runDiagnose(args []string) {
 			ctx, stop = signal.NotifyContext(ctx, os.Interrupt)
 		}
 		defer stop()
-		code := runClusterDiagnose(ctx, cluster, *namespace, podName, collector.Options{TailLines: *tailLines, PreviousLogs: *previousLogs}, *asJSON, *watch, *interval, *timeout, explainConfig{enabled: *explain, url: *llmURL, key: *llmKey, model: *llmModel})
+		code := runClusterDiagnose(ctx, engine, cluster, *namespace, podName, collector.Options{TailLines: *tailLines, PreviousLogs: *previousLogs}, *asJSON, *watch, *interval, *timeout, explainConfig{enabled: *explain, url: *llmURL, key: *llmKey, model: *llmModel})
 		if *exitCodes {
 			os.Exit(code)
 		}
@@ -106,8 +126,20 @@ func runDiagnose(args []string) {
 	if request.Pod.Metadata.Name == "" {
 		fatal(fmt.Errorf("pod.metadata.name is required"))
 	}
-	report := diagnosis.NewEngine().Diagnose(request)
+	report := engine.Diagnose(request)
 	writeHistory(report)
+	attachPatternMemory(&report)
+	if *simple {
+		fmt.Println(simpleExplanation(report))
+		if *explain {
+			explainReport(report, explainConfig{enabled: true, url: *llmURL, key: *llmKey, model: *llmModel, simple: true})
+		}
+		notifyAll(notifiers, report)
+		if *exitCodes {
+			os.Exit(reportExitCode(report))
+		}
+		return
+	}
 	if *asJSON {
 		writeIndented(report)
 	} else {
@@ -116,8 +148,108 @@ func runDiagnose(args []string) {
 	if *explain {
 		explainReport(report, explainConfig{enabled: true, url: *llmURL, key: *llmKey, model: *llmModel})
 	}
+	notifyAll(notifiers, report)
 	if *exitCodes {
 		os.Exit(reportExitCode(report))
+	}
+}
+
+func runDiagnoseNamespace(args []string) {
+	flags := flag.NewFlagSet("diagnose-namespace", flag.ExitOnError)
+	namespace := flags.String("namespace", "default", "Kubernetes namespace")
+	asJSON := flags.Bool("json", false, "write the workload report as JSON")
+	kubeconfig := flags.String("kubeconfig", "", "path to kubeconfig")
+	kubeContext := flags.String("context", "", "kubeconfig context")
+	tailLines := flags.Int64("tail", 200, "log lines per container")
+	previousLogs := flags.Bool("previous", false, "collect previous container logs")
+	exitCodes := flags.Bool("exit-code", false, "exit non-zero when any pod is unhealthy")
+	_ = flags.Parse(args)
+
+	cluster, err := collector.NewFromKubeconfig(*kubeconfig, *kubeContext)
+	if err != nil {
+		fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	requests, err := cluster.CollectNamespace(ctx, *namespace, collector.Options{TailLines: *tailLines, PreviousLogs: *previousLogs})
+	if err != nil {
+		fatal(err)
+	}
+
+	engine := diagnosis.NewEngine()
+	workload := model.WorkloadReport{
+		GeneratedAt: time.Now().UTC(),
+		Namespace:   *namespace,
+		Reports:     []model.Report{},
+	}
+
+	allPods, _ := cluster.ListPodCount(ctx, *namespace)
+	workload.TotalPods = allPods
+
+	causeCounts := map[string]string{}
+	for _, req := range requests {
+		report := engine.Diagnose(req)
+		writeHistory(report)
+		workload.Reports = append(workload.Reports, report)
+		if report.Status != "healthy" {
+			workload.UnhealthyCount++
+		} else {
+			workload.HealthyCount++
+		}
+		if report.RootCause != nil {
+			causeCounts[report.RootCause.Code] = report.RootCause.Title
+		}
+	}
+	workload.HealthyCount = workload.TotalPods - workload.UnhealthyCount
+
+	type causeEntry struct {
+		code  string
+		title string
+		count int
+	}
+	var causes []causeEntry
+	seen := map[string]int{}
+	for _, r := range workload.Reports {
+		if r.RootCause != nil {
+			seen[r.RootCause.Code]++
+		}
+	}
+	for code, count := range seen {
+		causes = append(causes, causeEntry{code: code, title: causeCounts[code], count: count})
+	}
+	sort.Slice(causes, func(i, j int) bool { return causes[i].count > causes[j].count })
+	for _, c := range causes {
+		if len(workload.CommonCauses) >= 5 {
+			break
+		}
+		workload.CommonCauses = append(workload.CommonCauses, model.CauseCount{Code: c.code, Title: c.title, Count: c.count})
+	}
+
+	if *asJSON {
+		writeIndented(workload)
+	} else {
+		printWorkloadReport(workload)
+	}
+	if *exitCodes && workload.UnhealthyCount > 0 {
+		os.Exit(2)
+	}
+}
+
+func printWorkloadReport(w model.WorkloadReport) {
+	fmt.Printf("Namespace: %s\n", w.Namespace)
+	fmt.Printf("Pods: %d total, %d healthy, %d unhealthy\n\n", w.TotalPods, w.HealthyCount, w.UnhealthyCount)
+	if len(w.CommonCauses) > 0 {
+		fmt.Println("Common root causes:")
+		for _, c := range w.CommonCauses {
+			fmt.Printf("  - %s (%s): %d pod(s)\n", c.Title, c.Code, c.Count)
+		}
+	}
+	for _, report := range w.Reports {
+		fmt.Printf("\n--- %s/%s: %s ---\n", report.Pod.Namespace, report.Pod.Name, strings.ToUpper(report.Status))
+		if report.RootCause != nil {
+			fmt.Printf("  Root cause: %s (%s)\n", report.RootCause.Title, report.RootCause.Code)
+		}
 	}
 }
 
@@ -126,9 +258,10 @@ type explainConfig struct {
 	url     string
 	key     string
 	model   string
+	simple  bool
 }
 
-func runClusterDiagnose(ctx context.Context, cluster *collector.Collector, namespace, podName string, options collector.Options, asJSON, watch bool, interval, timeout time.Duration, explain explainConfig) int {
+func runClusterDiagnose(ctx context.Context, engine *diagnosis.Engine, cluster *collector.Collector, namespace, podName string, options collector.Options, asJSON, watch bool, interval, timeout time.Duration, explain explainConfig) int {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
 	firstAttempt := true
 	lastStatus := "unknown"
@@ -140,7 +273,7 @@ func runClusterDiagnose(ctx context.Context, cluster *collector.Collector, names
 	}
 	for {
 		collectCtx, cancel := context.WithTimeout(ctx, timeout)
-		request, err := cluster.Collect(collectCtx, namespace, podName, options)
+		request, err := cluster.CollectWithDeployment(collectCtx, namespace, podName, options)
 		cancel()
 		if err != nil {
 			if firstAttempt {
@@ -154,8 +287,9 @@ func runClusterDiagnose(ctx context.Context, cluster *collector.Collector, names
 			)
 		} else {
 			backoff = interval
-			report := diagnosis.NewEngine().Diagnose(request)
+			report := engine.Diagnose(request)
 			lastStatus = report.Status
+			attachPatternMemory(&report)
 			var event *ChangeEvent
 			if tracker != nil {
 				event = tracker.track(report.Status, time.Now())
@@ -318,7 +452,11 @@ func explainReport(report model.Report, cfg explainConfig) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
-	explanation, err := llm.NewClient(config).Chat(ctx, llm.BuildPrompt(report))
+	messages := llm.BuildPrompt(report)
+	if cfg.simple {
+		messages = llm.BuildPromptSimple(report)
+	}
+	explanation, err := llm.NewClient(config).Chat(ctx, messages)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "kubewhy: LLM explanation failed: %v\n", err)
 		return
@@ -433,6 +571,21 @@ func printReport(report model.Report) {
 			fmt.Printf("  - %s: %s (count=%d)\n", event.Reason, event.Message, event.Count)
 		}
 	}
+	if len(report.PreviousOccurrences) > 0 {
+		fmt.Printf("\nPattern memory: %d previous occurrence(s) of %s in the last 7 days\n", len(report.PreviousOccurrences), report.PreviousOccurrences[0].RootCauseCode)
+		for _, occ := range report.PreviousOccurrences {
+			fmt.Printf("  - %s: %s\n", occ.Timestamp.Format("2006-01-02 15:04"), strings.ToUpper(occ.Status))
+		}
+	}
+	if report.DeploymentContext != nil {
+		dc := report.DeploymentContext
+		fmt.Printf("\nDeployment: %s/%s\n", dc.Namespace, dc.Name)
+		if dc.ActiveRollout {
+			fmt.Printf("  Active rollout (revision %s)\n", dc.CurrentRevision)
+		} else if dc.CurrentRevision != "" {
+			fmt.Printf("  Current revision: %s\n", dc.CurrentRevision)
+		}
+	}
 }
 
 func usage() {
@@ -456,4 +609,107 @@ Every diagnosis is stored in ~/.kubewhy/history.jsonl; browse it with
 POST /api/v1/diagnose with a DiagnoseRequest to use the API.`)
 }
 
+func buildNotifiers(slackWebhook, pagerdutyKey string) []integrations.Notifier {
+	if slackWebhook == "" {
+		slackWebhook = os.Getenv("KUBEWHY_SLACK_WEBHOOK")
+	}
+	if pagerdutyKey == "" {
+		pagerdutyKey = os.Getenv("KUBEWHY_PAGERDUTY_KEY")
+	}
+	var notifiers []integrations.Notifier
+	if slackWebhook != "" {
+		notifiers = append(notifiers, integrations.NewSlackNotifier(slackWebhook))
+	}
+	if pagerdutyKey != "" {
+		notifiers = append(notifiers, integrations.NewPagerDutyNotifier(pagerdutyKey))
+	}
+	return notifiers
+}
+
+func notifyAll(notifiers []integrations.Notifier, report model.Report) {
+	for _, n := range notifiers {
+		if err := n.Notify(report); err != nil {
+			fmt.Fprintf(os.Stderr, "kubewhy: notification failed: %v\n", err)
+		}
+	}
+}
+
+func simpleExplanation(report model.Report) string {
+	var statusMsg string
+	switch report.Status {
+	case "healthy":
+		statusMsg = "Your pod is running fine."
+	case "degraded":
+		statusMsg = "Your pod is running but something is not quite right."
+	case "broken":
+		statusMsg = "Your pod is not working properly."
+	default:
+		statusMsg = "We could not figure out what is going on with your pod."
+	}
+	if report.RootCause == nil {
+		return statusMsg
+	}
+	var causeMsg string
+	switch report.RootCause.Code {
+	case "oom_killed":
+		causeMsg = "It used too much memory and was stopped by Kubernetes."
+	case "crash_loop":
+		causeMsg = "It keeps crashing and restarting over and over."
+	case "image_pull_backoff", "image_pull":
+		causeMsg = "Kubernetes cannot download the container image."
+	case "log_dependency_unavailable":
+		causeMsg = "It cannot connect to a service it depends on."
+	case "log_config_error":
+		causeMsg = "Its configuration is missing something it needs to start."
+	case "pod_failed":
+		causeMsg = "It failed to run."
+	case "container_exit":
+		causeMsg = "The program inside the container stopped with an error."
+	case "restart_rapid":
+		causeMsg = "It crashes almost immediately after starting."
+	case "restart_creep":
+		causeMsg = "It runs for a while, then slowly runs out of memory and dies."
+	case "restart_after_stable":
+		causeMsg = "It was working fine for a long time, then something changed and it stopped."
+	case "resource_no_feasible_node":
+		causeMsg = "There is no server in your cluster with enough resources to run it."
+	default:
+		causeMsg = report.RootCause.Explanation
+	}
+	result := statusMsg + " " + causeMsg
+	if len(report.RootCause.Remediation) > 0 {
+		result += " Try: " + report.RootCause.Remediation[0] + "."
+	}
+	return result
+}
+
 func fatal(err error) { fmt.Fprintln(os.Stderr, "kubewhy:", err); os.Exit(1) }
+
+func attachPatternMemory(report *model.Report) {
+	if report.RootCause == nil {
+		return
+	}
+	if historyStore == nil {
+		historyOnce.Do(func() {
+			store, err := history.NewStore("")
+			if err != nil {
+				return
+			}
+			historyStore = store
+		})
+	}
+	if historyStore == nil {
+		return
+	}
+	occurrences, err := historyStore.QueryByPattern(report.Pod.Name, report.Pod.Namespace, report.RootCause.Code, time.Now().Add(-7*24*time.Hour))
+	if err != nil || len(occurrences) == 0 {
+		return
+	}
+	for _, occ := range occurrences {
+		report.PreviousOccurrences = append(report.PreviousOccurrences, model.PreviousOccurrence{
+			Timestamp:     occ.Timestamp,
+			Status:        occ.Status,
+			RootCauseCode: occ.Report.RootCause.Code,
+		})
+	}
+}
